@@ -77,7 +77,7 @@ tbody td{padding:0;border:1px solid var(--border);vertical-align:middle;height:3
     <span id="claseCounter" style="font-size:.78rem;color:var(--cat1);font-weight:400;background:var(--cat1-light);padding:4px 10px;border-radius:20px;border:1.5px solid #bfdbfe"></span>
     <button class="btn btn-ghost" onclick="openAddStudentModal()" style="color:#7b2d8b;border-color:#d7bde2">👤 Agregar estudiante</button>
     <button class="btn btn-ghost" onclick="clearAllGrades()">🗑 Limpiar notas</button>
-    <button class="btn btn-ghost" onclick="syncToSheets()">☁ Sincronizar / reintentar</button><button class="btn btn-ghost" onclick="downloadBackup()">⬇ Respaldo completo</button><button class="btn btn-ghost" onclick="resolveRecovery()">Revisar conflictos</button><button class="btn btn-accent" onclick="exportCSV()">⬇ Exportar CSV</button>
+    <button class="btn btn-ghost" onclick="syncToSheets()">☁ Sincronizar / reintentar</button><button class="btn btn-ghost" onclick="downloadBackup()">⬇ Respaldo completo</button><button class="btn btn-ghost" onclick="downloadBackup()">⬇ Historial de recuperación</button><button class="btn btn-accent" onclick="exportCSV()">⬇ Exportar CSV</button>
     <span style="margin-left:auto;display:flex;align-items:center;gap:8px"><span class="toolbar-label">Buscar:</span><input type="text" id="searchInput" placeholder="Buscar estudiante..." style="width:220px" oninput="filterStudents()"></span>
   </div>
   <div class="legend">
@@ -171,7 +171,7 @@ function applyConfigState(cfg){
 function loadLocalState(){try{const raw=localStorage.getItem(STORAGE_KEY);if(raw) applyConfigState(JSON.parse(raw));}catch(e){setSyncStatus('error','No se pudo leer el respaldo local: '+e.message);}}
 function buildSyncPayload(sheet){ ensureSheetState(sheet); migrateLegacyGrades(sheet); const students=getActiveStudents(sheet); const colHeaders=[]; CATS.forEach(cat=>{columns[sheet].filter(c=>c.cat===cat).forEach(col=>colHeaders.push(`${col.name} (${CAT_CONFIG[cat].label})`)); colHeaders.push(`Subtotal ${CAT_CONFIG[cat].label} (${Math.round(CAT_CONFIG[cat].weight*100)}%)`);}); const filas=students.map((s,i)=>{ const row=[i+1,s.name]; CATS.forEach(cat=>{ const nums=[]; columns[sheet].filter(c=>c.cat===cat).forEach(col=>{ const val=(grades[sheet][s.key]||{})[col.id]??''; row.push(val===''?'':val); const n=parseFloat(val); if(!isNaN(n)) nums.push({val:n,w:col.weight}); }); let sub=''; if(nums.length){const tw=nums.reduce((a,x)=>a+x.w,0); sub=tw>0?parseFloat(nums.reduce((a,x)=>a+x.val*(x.w/tw),0).toFixed(2)):'';} row.push(sub); }); const final=calculateFinal(sheet,s.key); row.push(final!==null?parseFloat(final.toFixed(2)):''); row.push(final!==null?gradeLabel(final):''); return row; }); return {curso:sheet,columnas:colHeaders,filas}; }
 // The confirmed server state is authoritative. Local storage journals pending edits.
-let ready=false, inFlight=false, revision=0, remoteBaseline=null, baseState=null, blocked=false, recoverySources=[];
+let ready=false, inFlight=false, revision=0, remoteBaseline=null, baseState=null, blocked=false, recoverySources=[], archivedStates=[], cloudConflicts=[];
 const dirty=new Set(), sheetVersions={}, JOURNAL_KEY=STORAGE_KEY+'_sync_v3';
 const clone=v=>JSON.parse(JSON.stringify(v));
 const present=v=>v!==''&&v!==null&&v!==undefined;
@@ -183,6 +183,11 @@ function normalizeState(cfg){
 }
 function snapshot(){return clone(buildConfigState());}
 function rememberSource(state){recoverySources.push(clone(state));if(recoverySources.length>3)recoverySources.shift();}
+function archiveLocal(reason){
+ const state=snapshot();if(archivedStates.some(a=>signature(a.config)===signature(state)))return;
+ archivedStates.push({savedAt:new Date().toISOString(),reason,config:state});
+ if(archivedStates.length>5)archivedStates.shift();
+}
 function renderState(){renderTabs();renderTable();updateClaseCounter();}
 function setSyncStatus(status,detail){
  const messages={loading:'Recuperando notas del servidor…',pending:'Cambios locales pendientes de sincronización',ok:'Notas actualizadas desde el servidor',error:'Sin conexión confirmada; se conserva el respaldo local',saved:'Notas confirmadas en el servidor — '+new Date().toLocaleTimeString('es-CO',{hour:'2-digit',minute:'2-digit'})};
@@ -192,7 +197,7 @@ function setSyncStatus(status,detail){
 }
 function persistJournal(){
  saveLocalState();
- try{localStorage.setItem(JOURNAL_KEY,JSON.stringify({state:snapshot(),base:baseState,pending:[...dirty]}));localStorage.setItem(STORAGE_KEY+'_pending',JSON.stringify([...dirty]));return true;}
+ try{localStorage.setItem(JOURNAL_KEY,JSON.stringify({state:snapshot(),base:baseState,pending:[...dirty],archivedStates}));localStorage.setItem(STORAGE_KEY+'_pending',JSON.stringify([...dirty]));return true;}
  catch(e){setSyncStatus('error','No se pudo guardar el respaldo local. Descarga un respaldo completo antes de cerrar.');return false;}
 }
 async function readRemote(){
@@ -219,15 +224,25 @@ function mergeThreeWay(base,local,remote,path='estado'){
    const value=mergeThreeWay(base[k],local[k],remote[k],path+' / '+k);if(value!==undefined)result[k]=value;
   }return result;
  }
- throw Error('Dos cambios distintos en '+path+'. Descarga el respaldo y usa Revisar conflictos.');
+ // When the same value was changed on both sides, the confirmed shared value wins.
+ // The displaced local state is archived by reconcile(), never silently discarded.
+ cloudConflicts.push(path);return remote===undefined?undefined:clone(remote);
 }
 function reconcile(remote){
  if(!dirty.size){applyConfigState(remote);baseState=clone(remote);remoteBaseline=signature(remote);return;}
  if(!baseState){
   if(signature(snapshot())===signature(remote)){dirty.clear();baseState=clone(remote);remoteBaseline=signature(remote);return;}
-  blocked=true;rememberSource(remote);throw Error('Este navegador tiene cambios de la versión anterior sin una base de comparación. Revisa los conflictos antes de enviar.');
+  archiveLocal('Copia de la versión anterior, sin base de comparación; se cargó el estado compartido del servidor.');
+  applyConfigState(remote);dirty.clear();baseState=clone(remote);remoteBaseline=signature(remote);blocked=false;return;
  }
- const merged=mergeThreeWay(baseState,snapshot(),remote);
+ cloudConflicts=[];
+ const local=snapshot(),merged=mergeThreeWay(baseState,local,remote);
+ // A conflicting activity schema can reuse IDs for different activities. Keep
+ // the entire server course in that case, rather than attaching grades to wrong IDs.
+ for(const s of Object.keys(SHEETS))if(signature(local.columns[s])!==signature(baseState.columns[s])&&signature(remote.columns[s])!==signature(baseState.columns[s])&&signature(local.columns[s])!==signature(remote.columns[s])){
+  for(const f of FIELDS)merged[f][s]=clone(remote[f][s]);cloudConflicts.push('Actividades / '+s);
+ }
+ if(cloudConflicts.length)archiveLocal('Se conservaron los valores del servidor en cambios simultáneos: '+cloudConflicts.join(', '));
  applyConfigState(merged);baseState=clone(remote);remoteBaseline=signature(remote);
  for(const s of [...dirty])if(FIELDS.every(f=>signature(merged[f][s])===signature(remote[f][s])))dirty.delete(s);
 }
@@ -241,7 +256,6 @@ async function postPayload(payload){
 }
 async function syncToSheets(){
  if(inFlight||!ready)return;
- if(blocked){setSyncStatus('error','Hay cambios en conflicto. Usa Revisar conflictos; tus notas locales siguen conservadas.');return;}
  inFlight=true;let repeat=false;
  try{
   const remote=await readRemote();rememberSource(remote);reconcile(remote);
@@ -258,11 +272,11 @@ async function syncToSheets(){
   for(const s of sentSheets)if((sheetVersions[s]||0)===(sentVersions[s]||0))dirty.delete(s);
   persistJournal();repeat=dirty.size>0;
   setSyncStatus(repeat?'pending':'saved',repeat?'Guardando los cambios nuevos realizados durante el envío…':undefined);
- }catch(e){console.error(e);if(/Dos cambios distintos/.test(e.message))blocked=true;setSyncStatus('error',e.message+' — respaldo local conservado');persistJournal();}
+ }catch(e){console.error(e);setSyncStatus('error',e.message+' — respaldo local conservado');persistJournal();}
  finally{inFlight=false;if(repeat){clearTimeout(syncTimer);syncTimer=setTimeout(syncToSheets,200);}}
 }
 async function refreshRemote(){
- if(!ready||inFlight||blocked||document.hidden||document.activeElement?.classList?.contains('grade-input'))return;
+ if(!ready||inFlight||document.hidden||document.activeElement?.classList?.contains('grade-input'))return;
  if(dirty.size){syncToSheets();return;}
  inFlight=true;
  try{const remote=await readRemote();if(document.activeElement?.classList?.contains('grade-input'))return;if(signature(remote)!==remoteBaseline){rememberSource(snapshot());reconcile(remote);persistJournal();renderState();}setSyncStatus(dirty.size?'pending':'ok');}
@@ -274,7 +288,7 @@ async function loadFromSheets(){
  try{
   let localExists=false,journal=null;
   try{journal=JSON.parse(localStorage.getItem(JOURNAL_KEY)||'null');}catch(e){console.warn(e);}
-  if(journal?.state){applyConfigState(journal.state);localExists=true;baseState=journal.base?normalizeState(journal.base):null;for(const s of journal.pending||[])if(SHEETS[s])dirty.add(s);}
+  if(journal?.state){applyConfigState(journal.state);localExists=true;baseState=journal.base?normalizeState(journal.base):null;archivedStates=Array.isArray(journal.archivedStates)?journal.archivedStates:[];for(const s of journal.pending||[])if(SHEETS[s])dirty.add(s);}
   else{loadLocalState();try{localExists=!!localStorage.getItem(STORAGE_KEY);for(const s of JSON.parse(localStorage.getItem(STORAGE_KEY+'_pending')||'[]'))if(SHEETS[s])dirty.add(s);}catch(e){console.warn(e);}}
   if(!localExists)applyConfigState(EXCEL_BACKUP);
   try{const remote=await readRemote();if(localExists)rememberSource(snapshot());rememberSource(remote);reconcile(remote);persistJournal();setSyncStatus(dirty.size?'pending':'ok');}
@@ -283,30 +297,14 @@ async function loadFromSheets(){
  if(dirty.size&&!blocked){clearTimeout(syncTimer);syncTimer=setTimeout(syncToSheets,900);}
 }
 function downloadBackup(){
- const blob=new Blob([JSON.stringify({savedAt:new Date().toISOString(),config:snapshot(),base:baseState,pending:[...dirty],recoverySources},null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='respaldo-notas-'+new Date().toISOString().slice(0,10)+'.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);
-}
-async function resolveRecovery(){
- if(!blocked){showToast('No hay conflictos pendientes');return;}
- if(inFlight)return;inFlight=true;
- try{
-  const remote=await readRemote();rememberSource(snapshot());rememberSource(remote);downloadBackup();
-  const choice=prompt('Se descargó un respaldo de ambas fuentes. Escribe SERVIDOR para cargar las notas compartidas de Google Sheets, o LOCAL para conservar tus cursos pendientes y enviarlos sobre el estado actual. Cancelar conserva todo sin enviar.');
-  if(choice===null)return;
-  if(normalizeText(choice)==='SERVIDOR'){applyConfigState(remote);dirty.clear();}
-  else if(normalizeText(choice)==='LOCAL'){
-   const local=snapshot(),chosen=clone(remote);for(const s of dirty)for(const f of FIELDS)chosen[f][s]=clone(local[f][s]);applyConfigState(chosen);
-  }else{showToast('Escribe SERVIDOR o LOCAL');return;}
-  baseState=clone(remote);remoteBaseline=signature(remote);blocked=false;persistJournal();renderState();setSyncStatus(dirty.size?'pending':'ok');
- }catch(e){setSyncStatus('error',e.message);}
- finally{inFlight=false;}
- if(dirty.size&&!blocked)syncToSheets();
+ const blob=new Blob([JSON.stringify({savedAt:new Date().toISOString(),config:snapshot(),base:baseState,pending:[...dirty],recoverySources,archivedStates},null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='respaldo-notas-'+new Date().toISOString().slice(0,10)+'.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);
 }
 window.addEventListener('beforeunload',()=>{if(ready)persistJournal();});
 window.addEventListener('online',refreshRemote);
 window.addEventListener('focus',refreshRemote);
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)refreshRemote();});
-window.addEventListener('storage',e=>{if(e.key===JOURNAL_KEY){if(dirty.size){blocked=true;setSyncStatus('error','Otra pestaña cambió el respaldo. Descarga tus notas y revisa los conflictos antes de enviar.');}else refreshRemote();}});
-setInterval(refreshRemote,30000);
+window.addEventListener('storage',e=>{if(e.key===JOURNAL_KEY)refreshRemote();});
+setInterval(refreshRemote,10000);
 
 function openModal(id){document.getElementById(id).classList.add('open')} function closeModal(id){document.getElementById(id).classList.remove('open')} document.querySelectorAll('.modal-overlay').forEach(el=>el.addEventListener('click',e=>{if(e.target===el)el.classList.remove('open')}));
 function showToast(msg){const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('show'); clearTimeout(toastTimer); toastTimer=setTimeout(()=>t.classList.remove('show'),2500)}
