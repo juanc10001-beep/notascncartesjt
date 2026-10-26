@@ -159,9 +159,10 @@ function applyConfigState(cfg){
  for(const s of Object.keys(SHEETS)){
   ensureSheetState(s);
   if(Array.isArray(cfg.columns?.[s])) columns[s]=cfg.columns[s].filter(c=>Number.isInteger(c.id)&&CATS.includes(c.cat)&&typeof c.name==='string').map(c=>({...c,weight:Number(c.weight)>0?Number(c.weight):100}));
-  if(cfg.grades?.[s] && typeof cfg.grades[s]==='object') grades[s]=cfg.grades[s];
+  if(cfg.grades?.[s] && typeof cfg.grades[s]==='object') grades[s]=JSON.parse(JSON.stringify(cfg.grades[s]));
   if(Array.isArray(cfg.studentsExtra?.[s])) studentsExtra[s]=cfg.studentsExtra[s];
   if(Array.isArray(cfg.deletedStudents?.[s])) deletedStudents[s]=cfg.deletedStudents[s];
+  SHEETS[s]=[...(LEGACY_ROSTER[s]||[])];
   for(const n of studentsExtra[s]) if(!SHEETS[s].includes(normalizeText(n))) SHEETS[s].push(normalizeText(n));
   colIdCounters[s]=Math.max(0,...columns[s].map(c=>c.id),Number(cfg.colIdCounters?.[s])||0);
   migrateLegacyGrades(s);normalizeAndSortSheet(s);
@@ -169,106 +170,143 @@ function applyConfigState(cfg){
 }
 function loadLocalState(){try{const raw=localStorage.getItem(STORAGE_KEY);if(raw) applyConfigState(JSON.parse(raw));}catch(e){setSyncStatus('error','No se pudo leer el respaldo local: '+e.message);}}
 function buildSyncPayload(sheet){ ensureSheetState(sheet); migrateLegacyGrades(sheet); const students=getActiveStudents(sheet); const colHeaders=[]; CATS.forEach(cat=>{columns[sheet].filter(c=>c.cat===cat).forEach(col=>colHeaders.push(`${col.name} (${CAT_CONFIG[cat].label})`)); colHeaders.push(`Subtotal ${CAT_CONFIG[cat].label} (${Math.round(CAT_CONFIG[cat].weight*100)}%)`);}); const filas=students.map((s,i)=>{ const row=[i+1,s.name]; CATS.forEach(cat=>{ const nums=[]; columns[sheet].filter(c=>c.cat===cat).forEach(col=>{ const val=(grades[sheet][s.key]||{})[col.id]??''; row.push(val===''?'':val); const n=parseFloat(val); if(!isNaN(n)) nums.push({val:n,w:col.weight}); }); let sub=''; if(nums.length){const tw=nums.reduce((a,x)=>a+x.w,0); sub=tw>0?parseFloat(nums.reduce((a,x)=>a+x.val*(x.w/tw),0).toFixed(2)):'';} row.push(sub); }); const final=calculateFinal(sheet,s.key); row.push(final!==null?parseFloat(final.toFixed(2)):''); row.push(final!==null?gradeLabel(final):''); return row; }); return {curso:sheet,columnas:colHeaders,filas}; }
-// Conserves the existing Apps Script POST contract. No write on startup.
-let ready=false, inFlight=false, revision=0, remoteBaseline=null, blocked=false, recoverySources=[];
-const dirty=new Set();
+// The confirmed server state is authoritative. Local storage journals pending edits.
+let ready=false, inFlight=false, revision=0, remoteBaseline=null, baseState=null, blocked=false, recoverySources=[];
+const dirty=new Set(), sheetVersions={}, JOURNAL_KEY=STORAGE_KEY+'_sync_v3';
 const clone=v=>JSON.parse(JSON.stringify(v));
 const present=v=>v!==''&&v!==null&&v!==undefined;
 function canonical(v){if(Array.isArray(v))return v.map(canonical);if(v&&typeof v==='object')return Object.fromEntries(Object.keys(v).sort().map(k=>[k,canonical(v[k])]));return v;}
 const signature=v=>JSON.stringify(canonical(v));
+const FIELDS=['columns','grades','studentsExtra','deletedStudents','colIdCounters'];
+function normalizeState(cfg){
+ const result={};for(const f of FIELDS){result[f]={};for(const s of Object.keys(SHEETS))result[f][s]=clone(cfg[f]?.[s]??(f==='grades'?{}:f==='colIdCounters'?0:[]));}return result;
+}
+function snapshot(){return clone(buildConfigState());}
+function rememberSource(state){recoverySources.push(clone(state));if(recoverySources.length>3)recoverySources.shift();}
+function renderState(){renderTabs();renderTable();updateClaseCounter();}
 function setSyncStatus(status,detail){
- const messages={loading:'Recuperando notas; la edición se habilitará al terminar…',pending:'Cambios pendientes de sincronización',ok:'Estado recuperado; sin cambios pendientes',error:'Sin conexión confirmada; se conserva el respaldo local',sent:'Envío realizado; guardado de las filas no confirmado por Apps Script'};
- const bar=document.getElementById('syncBar');bar.style.background=status==='error'?'#fef2f2':status==='ok'?'#f0fdf4':'#fefce8';
- document.getElementById('syncMsg').textContent=detail||messages[status];document.getElementById('syncIcon').textContent=status==='error'?'⚠️':status==='ok'?'✅':'☁️';document.getElementById('syncSpinner').style.display=status==='loading'?'inline':'none';
+ const messages={loading:'Recuperando notas del servidor…',pending:'Cambios locales pendientes de sincronización',ok:'Notas actualizadas desde el servidor',error:'Sin conexión confirmada; se conserva el respaldo local',saved:'Notas confirmadas en el servidor — '+new Date().toLocaleTimeString('es-CO',{hour:'2-digit',minute:'2-digit'})};
+ const bar=document.getElementById('syncBar');bar.style.background=status==='error'?'#fef2f2':status==='ok'||status==='saved'?'#f0fdf4':'#fefce8';
+ bar.style.color=status==='error'?'#991b1b':status==='ok'||status==='saved'?'#166534':'#92400e';
+ document.getElementById('syncMsg').textContent=detail||messages[status];document.getElementById('syncIcon').textContent=status==='error'?'⚠️':status==='ok'||status==='saved'?'✅':'☁️';document.getElementById('syncSpinner').style.display=status==='loading'||status==='pending'?'inline':'none';
+}
+function persistJournal(){
+ saveLocalState();
+ try{localStorage.setItem(JOURNAL_KEY,JSON.stringify({state:snapshot(),base:baseState,pending:[...dirty]}));localStorage.setItem(STORAGE_KEY+'_pending',JSON.stringify([...dirty]));return true;}
+ catch(e){setSyncStatus('error','No se pudo guardar el respaldo local. Descarga un respaldo completo antes de cerrar.');return false;}
 }
 async function readRemote(){
- const controller=new AbortController(), timer=setTimeout(()=>controller.abort(),15000);
- try{const r=await fetch(SHEETS_URL+'?t='+Date.now(),{signal:controller.signal,cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);const d=await r.json();const cfg=d?.config??d;
- if(!cfg||typeof cfg!=='object'||Array.isArray(cfg)||!cfg.columns||!cfg.grades)throw Error('Apps Script no devolvió un estado de notas válido; no se enviarán datos');return cfg;
+ const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),20000);
+ try{
+  const r=await fetch(SHEETS_URL+'?t='+Date.now(),{signal:controller.signal,cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);
+  const d=await r.json(),cfg=d?.config??d;
+  if(d?.success===false)throw Error(d.error||'Error de Apps Script');
+  if(d?.status==='ok'&&!d.config&&!d.columns)throw Error('Apps Script responde ok, pero no entrega las notas. Revisa la versión implementada.');
+  if(!cfg||!cfg.columns||!cfg.grades||!Object.values(cfg.columns).some(c=>Array.isArray(c)&&c.length))throw Error('Respuesta sin notas ni configuración recuperable. No se enviarán datos vacíos.');
+  for(const s of Object.keys(SHEETS)){
+   if(!Array.isArray(cfg.columns[s])||!cfg.grades[s]||typeof cfg.grades[s]!=='object'||Array.isArray(cfg.grades[s]))throw Error('Estado remoto incompleto para '+s+'; se conserva el respaldo.');
+   const ids=new Set();for(const c of cfg.columns[s]){if(!Number.isInteger(c.id)||ids.has(c.id)||!CATS.includes(c.cat)||typeof c.name!=='string'||!Number.isFinite(Number(c.weight))||Number(c.weight)<=0)throw Error('Actividades inválidas en '+s);ids.add(c.id);}
+  }
+  return normalizeState(cfg);
  }finally{clearTimeout(timer);}
 }
-function mergeRecovery(incoming){
- recoverySources.push(clone(incoming));
- // Match by category/name/occurrence; never merge two different activities by ID.
- const state=clone(buildConfigState());
- for(const s of Object.keys(SHEETS)){
-  const src=incoming.columns?.[s];if(!Array.isArray(src))continue;
-  const used=new Set(), map={};let max=Math.max(0,...state.columns[s].map(c=>c.id));
-  for(const c of src){if(!CATS.includes(c.cat)||!Number.isInteger(c.id)||typeof c.name!=='string')continue;
-   let match=state.columns[s].find(x=>!used.has(x.id)&&x.cat===c.cat&&normalizeText(x.name)===normalizeText(c.name));
-   if(!match){match={...c,id:++max,weight:Number(c.weight)>0?Number(c.weight):100};state.columns[s].push(match);}used.add(match.id);map[c.id]=match.id;
-  }
-  state.colIdCounters[s]=max;
-  for(const [key,cells] of Object.entries(incoming.grades?.[s]||{})){
-   if(!cells||typeof cells!=='object')continue;
-   const target=state.grades[s][key]||(state.grades[s][key]={});
-   for(const [id,value] of Object.entries(cells)){
-    if(!present(value)||!Number.isFinite(Number(value))||Number(value)<0||Number(value)>5)continue;
-    const mapped=map[id];if(mapped===undefined){blocked=true;continue;}
-    if(!present(target[mapped]))target[mapped]=Number(value);
-    else if(Number(target[mapped])!==Number(value))blocked=true;
-   }
-  }
-  state.studentsExtra[s]=[...new Set([...state.studentsExtra[s],...(incoming.studentsExtra?.[s]||[])].map(normalizeText))];
-  state.deletedStudents[s]=[...new Set([...state.deletedStudents[s],...(incoming.deletedStudents?.[s]||[])])];
+function mergeThreeWay(base,local,remote,path='estado'){
+ if(signature(local)===signature(base))return remote===undefined?undefined:clone(remote);
+ if(signature(remote)===signature(base)||signature(local)===signature(remote))return local===undefined?undefined:clone(local);
+ const object=v=>v!==null&&typeof v==='object'&&!Array.isArray(v);
+ if(object(base)&&object(local)&&object(remote)){
+  const result={};for(const k of new Set([...Object.keys(base),...Object.keys(local),...Object.keys(remote)])){
+   const value=mergeThreeWay(base[k],local[k],remote[k],path+' / '+k);if(value!==undefined)result[k]=value;
+  }return result;
  }
- applyConfigState(state);
+ throw Error('Dos cambios distintos en '+path+'. Descarga el respaldo y usa Revisar conflictos.');
+}
+function reconcile(remote){
+ if(!dirty.size){applyConfigState(remote);baseState=clone(remote);remoteBaseline=signature(remote);return;}
+ if(!baseState){
+  if(signature(snapshot())===signature(remote)){dirty.clear();baseState=clone(remote);remoteBaseline=signature(remote);return;}
+  blocked=true;rememberSource(remote);throw Error('Este navegador tiene cambios de la versión anterior sin una base de comparación. Revisa los conflictos antes de enviar.');
+ }
+ const merged=mergeThreeWay(baseState,snapshot(),remote);
+ applyConfigState(merged);baseState=clone(remote);remoteBaseline=signature(remote);
+ for(const s of [...dirty])if(FIELDS.every(f=>signature(merged[f][s])===signature(remote[f][s])))dirty.delete(s);
 }
 function scheduleSync(){
- revision++;dirty.add(currentSheet);saveLocalState();
- try{localStorage.setItem(STORAGE_KEY+'_pending',JSON.stringify([...dirty]));}catch(e){setSyncStatus('error','No se pudo guardar el respaldo local. Descarga un respaldo completo.');return;}
- clearTimeout(syncTimer);setSyncStatus('pending');syncTimer=setTimeout(syncToSheets,1000);
+ revision++;sheetVersions[currentSheet]=revision;dirty.add(currentSheet);persistJournal();
+ clearTimeout(syncTimer);setSyncStatus('pending');syncTimer=setTimeout(syncToSheets,900);
 }
 async function postPayload(payload){
- const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),20000);
+ const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),25000);
  try{await fetch(SHEETS_URL,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain;charset=UTF-8'},body:JSON.stringify(payload),signal:controller.signal});}finally{clearTimeout(timer);}
 }
 async function syncToSheets(){
  if(inFlight||!ready)return;
- if(blocked){setSyncStatus('error','Hay notas distintas entre respaldos. Se conservó la versión local; descarga el respaldo y revisa Google Sheets antes de enviar.');return;}
- if(!dirty.size){setSyncStatus('ok','Sin cambios locales pendientes');return;}
- inFlight=true;const version=revision;setSyncStatus('pending');
+ if(blocked){setSyncStatus('error','Hay cambios en conflicto. Usa Revisar conflictos; tus notas locales siguen conservadas.');return;}
+ inFlight=true;let repeat=false;
  try{
-  const remote=await readRemote();
-  if(remoteBaseline===null){mergeRecovery(remote);remoteBaseline=signature(remote);saveLocalState();renderTabs();renderTable();updateClaseCounter();throw Error('Estado remoto recuperado. Revisa las notas y pulsa Sincronizar de nuevo.');}
-  if(signature(remote)!==remoteBaseline)throw Error('Google Sheets cambió desde la carga. Recarga la página para recuperar los cambios antes de enviar.');
-  const config=clone(buildConfigState());const payloads=[...dirty].map(buildSyncPayload);
-  // An incomplete schema must never clear a remote worksheet.
-  for(const p of payloads){if(!columns[p.curso].length||Object.keys(grades[p.curso]||{}).some(k=>/^\d+$/.test(k)))throw Error('Hay columnas o estudiantes sin recuperar; envío bloqueado para proteger las notas.');}
+  const remote=await readRemote();rememberSource(remote);reconcile(remote);
+  if(!dirty.size){persistJournal();renderState();setSyncStatus('ok');return;}
+  setSyncStatus('pending');
+  const sentSheets=[...dirty],sentVersions={...sheetVersions},config=snapshot(),payloads=sentSheets.map(buildSyncPayload);
+  for(const p of payloads)if(!config.columns[p.curso].length||!p.filas.length||Object.keys(config.grades[p.curso]).some(k=>/^\d+$/.test(k)))throw Error('Hay actividades o estudiantes sin recuperar en '+p.curso+'. No se enviaron datos.');
   await postPayload({type:'config',config});
   for(const p of payloads)await postPayload(p);
-  const verified=await readRemote();remoteBaseline=signature(verified);
-  if(signature(verified)!==signature(config))throw Error('El estado enviado aún no coincide con la lectura de Apps Script. Conserva el respaldo y reintenta.');
-  // Opaque POST responses cannot prove worksheet persistence. Keep queue until
-  // the backend offers an acknowledgement; a later explicit retry is safe.
-  setSyncStatus('sent',version!==revision?'Hay nuevos cambios locales pendientes; vuelve a sincronizar.':undefined);
- }catch(e){console.error(e);setSyncStatus('error',e.message+' — cambios conservados localmente');}
- finally{inFlight=false;saveLocalState();}
+  // Confirm the source used by every browser: the persisted configuration.
+  const verified=await readRemote();
+  if(signature(verified)!==signature(config))throw Error('No se confirmó el estado enviado. Las notas siguen pendientes; pulsa Sincronizar para reintentar.');
+  baseState=clone(verified);remoteBaseline=signature(verified);
+  for(const s of sentSheets)if((sheetVersions[s]||0)===(sentVersions[s]||0))dirty.delete(s);
+  persistJournal();repeat=dirty.size>0;
+  setSyncStatus(repeat?'pending':'saved',repeat?'Guardando los cambios nuevos realizados durante el envío…':undefined);
+ }catch(e){console.error(e);if(/Dos cambios distintos/.test(e.message))blocked=true;setSyncStatus('error',e.message+' — respaldo local conservado');persistJournal();}
+ finally{inFlight=false;if(repeat){clearTimeout(syncTimer);syncTimer=setTimeout(syncToSheets,200);}}
+}
+async function refreshRemote(){
+ if(!ready||inFlight||blocked||document.hidden||document.activeElement?.classList?.contains('grade-input'))return;
+ if(dirty.size){syncToSheets();return;}
+ inFlight=true;
+ try{const remote=await readRemote();if(document.activeElement?.classList?.contains('grade-input'))return;if(signature(remote)!==remoteBaseline){rememberSource(snapshot());reconcile(remote);persistJournal();renderState();}setSyncStatus(dirty.size?'pending':'ok');}
+ catch(e){setSyncStatus('error',e.message+' — mostrando respaldo local');}
+ finally{inFlight=false;if(dirty.size&&!blocked){clearTimeout(syncTimer);syncTimer=setTimeout(syncToSheets,200);}}
 }
 async function loadFromSheets(){
  setSyncStatus('loading');document.getElementById('app').inert=true;
  try{
-  loadLocalState();
-  let localExists=false;try{localExists=!!localStorage.getItem(STORAGE_KEY);for(const s of JSON.parse(localStorage.getItem(STORAGE_KEY+'_pending')||'[]'))if(SHEETS[s])dirty.add(s);}catch(e){console.warn(e);}
-  // Seed only a first visit: intentional deletions in a local state stay deleted.
+  let localExists=false,journal=null;
+  try{journal=JSON.parse(localStorage.getItem(JOURNAL_KEY)||'null');}catch(e){console.warn(e);}
+  if(journal?.state){applyConfigState(journal.state);localExists=true;baseState=journal.base?normalizeState(journal.base):null;for(const s of journal.pending||[])if(SHEETS[s])dirty.add(s);}
+  else{loadLocalState();try{localExists=!!localStorage.getItem(STORAGE_KEY);for(const s of JSON.parse(localStorage.getItem(STORAGE_KEY+'_pending')||'[]'))if(SHEETS[s])dirty.add(s);}catch(e){console.warn(e);}}
   if(!localExists)applyConfigState(EXCEL_BACKUP);
-  try{const remote=await readRemote();remoteBaseline=signature(remote);
-   if(!localExists){applyConfigState(remote);mergeRecovery(EXCEL_BACKUP);}else mergeRecovery(remote);}
-  catch(e){setSyncStatus('error',e.message+' — mostrando respaldo local / Excel');ready=true;return;}
-  setSyncStatus(blocked?'error':'ok',blocked?'Se encontraron notas distintas entre fuentes. Se conserva el respaldo local / Excel; sincronización bloqueada para revisión.':undefined);
- }finally{ready=true;saveLocalState();document.getElementById('app').inert=false;renderTabs();renderTable();updateClaseCounter();}
+  try{const remote=await readRemote();if(localExists)rememberSource(snapshot());rememberSource(remote);reconcile(remote);persistJournal();setSyncStatus(dirty.size?'pending':'ok');}
+  catch(e){setSyncStatus('error',e.message+' — mostrando respaldo local / Excel');}
+ }finally{ready=true;persistJournal();document.getElementById('app').inert=false;renderState();}
+ if(dirty.size&&!blocked){clearTimeout(syncTimer);syncTimer=setTimeout(syncToSheets,900);}
 }
 function downloadBackup(){
- const blob=new Blob([JSON.stringify({savedAt:new Date().toISOString(),config:buildConfigState(),recoverySources},null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='respaldo-notas-'+new Date().toISOString().slice(0,10)+'.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+ const blob=new Blob([JSON.stringify({savedAt:new Date().toISOString(),config:snapshot(),base:baseState,pending:[...dirty],recoverySources},null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='respaldo-notas-'+new Date().toISOString().slice(0,10)+'.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);
 }
-function resolveRecovery(){
+async function resolveRecovery(){
  if(!blocked){showToast('No hay conflictos pendientes');return;}
- downloadBackup();
- if(confirm('Se descargó un respaldo con las fuentes en conflicto. Revisa las notas visibles y Google Sheets. ¿Confirmas usar el estado visible para los próximos envíos?')){blocked=false;setSyncStatus('pending','Estado visible seleccionado. Pulsa Sincronizar para enviar cambios pendientes.');}
+ if(inFlight)return;inFlight=true;
+ try{
+  const remote=await readRemote();rememberSource(snapshot());rememberSource(remote);downloadBackup();
+  const choice=prompt('Se descargó un respaldo de ambas fuentes. Escribe SERVIDOR para cargar las notas compartidas de Google Sheets, o LOCAL para conservar tus cursos pendientes y enviarlos sobre el estado actual. Cancelar conserva todo sin enviar.');
+  if(choice===null)return;
+  if(normalizeText(choice)==='SERVIDOR'){applyConfigState(remote);dirty.clear();}
+  else if(normalizeText(choice)==='LOCAL'){
+   const local=snapshot(),chosen=clone(remote);for(const s of dirty)for(const f of FIELDS)chosen[f][s]=clone(local[f][s]);applyConfigState(chosen);
+  }else{showToast('Escribe SERVIDOR o LOCAL');return;}
+  baseState=clone(remote);remoteBaseline=signature(remote);blocked=false;persistJournal();renderState();setSyncStatus(dirty.size?'pending':'ok');
+ }catch(e){setSyncStatus('error',e.message);}
+ finally{inFlight=false;}
+ if(dirty.size&&!blocked)syncToSheets();
 }
-window.addEventListener('beforeunload',()=>saveLocalState());
-window.addEventListener('online',()=>{if(dirty.size)setSyncStatus('pending','Conexión restablecida. Pulsa Sincronizar para reintentar.');});
-window.addEventListener('storage',e=>{if(e.key===STORAGE_KEY){blocked=true;setSyncStatus('error','Otra pestaña modificó el respaldo. Recarga antes de editar o sincronizar.');}});
+window.addEventListener('beforeunload',()=>{if(ready)persistJournal();});
+window.addEventListener('online',refreshRemote);
+window.addEventListener('focus',refreshRemote);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)refreshRemote();});
+window.addEventListener('storage',e=>{if(e.key===JOURNAL_KEY){if(dirty.size){blocked=true;setSyncStatus('error','Otra pestaña cambió el respaldo. Descarga tus notas y revisa los conflictos antes de enviar.');}else refreshRemote();}});
+setInterval(refreshRemote,30000);
 
 function openModal(id){document.getElementById(id).classList.add('open')} function closeModal(id){document.getElementById(id).classList.remove('open')} document.querySelectorAll('.modal-overlay').forEach(el=>el.addEventListener('click',e=>{if(e.target===el)el.classList.remove('open')}));
 function showToast(msg){const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('show'); clearTimeout(toastTimer); toastTimer=setTimeout(()=>t.classList.remove('show'),2500)}
